@@ -1,0 +1,13 @@
+langchain==0.3.25
+langgraph==0.4.5
+langchain-openai==0.3.18
+python-dotenv==1.1.0
+gradio==5.34.2
+langchain_community
+langchain-tavily
+chromadb
+PyPDF2
+python-docx
+docx
+beautifulsoup4
+

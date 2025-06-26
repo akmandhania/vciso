@@ -1,0 +1,12 @@
+Incident Response Policy
+
+Purpose:
+To establish procedures for responding to information security incidents.
+
+Scope:
+This policy applies to all employees, contractors, and third-party users.
+
+Policy:
+- All incidents must be reported to the IT Security Team.
+- The team will assess, contain, and eradicate threats.
+- Post-incident reviews will be conducted. 

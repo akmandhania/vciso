@@ -1,0 +1,13 @@
+Data Breach Response Plan
+
+Purpose:
+To provide a structured approach for responding to data breaches.
+
+Scope:
+This plan applies to all data handled by the company.
+
+Plan:
+- Immediately contain and assess the breach.
+- Notify affected parties and regulatory authorities as required.
+- Investigate the cause and implement corrective actions.
+- Document the incident and lessons learned. 

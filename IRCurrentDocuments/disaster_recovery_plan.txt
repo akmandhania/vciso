@@ -1,0 +1,13 @@
+Disaster Recovery Plan
+
+Purpose:
+To restore IT systems and data after a disaster or major incident.
+
+Scope:
+This plan applies to all IT infrastructure and data assets.
+
+Plan:
+- Maintain regular backups of all critical data.
+- Define recovery time objectives for each system.
+- Test disaster recovery procedures annually.
+- Assign roles and responsibilities for recovery tasks. 
