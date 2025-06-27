@@ -17,16 +17,30 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from chromadb.utils import embedding_functions
+from pydantic import BaseModel
+from langchain_core.output_parsers import PydanticOutputParser
 
 # Disable ChromaDB telemetry
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
+# Suppress ONNX provider warnings from chromadb embedding functions
+logging.getLogger("chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2").setLevel(logging.ERROR)
+
 # Configure logging
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress third-party library logs at INFO level
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
+logging.getLogger("langchain").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("tiktoken").setLevel(logging.WARNING)
+
 MAX_TOKENS = 1024
-MAX_INTERACTIONS = 30
+MAX_INTERACTIONS = 50
 DOCUMENTS_FOLDER = os.path.join(os.path.dirname(__file__), "IRCurrentDocuments")
 
 # Incident Response specific prompts
@@ -212,6 +226,13 @@ class DocumentChunk(TypedDict):
     content: str
     chunk_id: str
 
+class IncidentStep(BaseModel):
+    title: str
+    description: str
+
+class IncidentResponsePlan(BaseModel):
+    steps: List[IncidentStep]
+
 class IncidentResponseGuide:
     """Interactive incident response guidance system (RAG-only, no direct file parsing)"""
     
@@ -236,45 +257,81 @@ class IncidentResponseGuide:
         self.rag_retriever = rag_retriever
 
     def start_incident_response(self, incident_type: str) -> str:
-        """Start incident response for a specific type using RAG+LLM plan synthesis"""
+        logger.info(f"Entered start_incident_response for: {incident_type}")
+        incident_type = incident_type.lower().strip()
         if incident_type not in self.incident_types:
+            logger.warning(f"Invalid incident type: {incident_type}")
             return "Invalid incident type. Please choose from: data_breach, phishing, ransomware"
+        logger.debug("Set incident type, step, responses")
         self.current_incident = incident_type
         self.current_step = 0
         self.step_responses = []
-        # RAG retrieval for plan synthesis
+        logger.debug("About to retrieve RAG docs")
         rag_docs = self.rag_retriever.retrieve(incident_type, top_k=10) if self.rag_retriever else []
+        logger.info(f"RAG docs retrieved: {len(rag_docs)}")
         rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
+        logger.debug("RAG text prepared")
         plan_prompt = f"""
-You are an expert security consultant. Based on the following policy excerpts, generate a step-by-step incident response plan for a {self.incident_types[incident_type]}. Output a JSON array where each item is an object with 'title' and 'description'.
+You are an expert security consultant. Based ONLY on the following company policy excerpts, generate a step-by-step incident response plan for a {self.incident_types[incident_type]}.
 
+IMPORTANT: Use ONLY the information provided in the policy excerpts below. Do NOT use any external knowledge, best practices, or general security expertise. If the policy excerpts don't contain enough information for a complete plan, indicate what information is missing.
+
+Create a structured response with a list of steps. Each step should have a clear title and detailed description based solely on the company's documented procedures.
+
+The response should be structured as a JSON object with a "steps" array containing objects with "title" and "description" fields.
+
+Example format:
+{{
+  "steps": [
+    {{
+      "title": "Immediate Containment",
+      "description": "Based on company policy: [specific procedure from documents]..."
+    }},
+    {{
+      "title": "Evidence Preservation", 
+      "description": "According to company procedures: [specific steps from documents]..."
+    }}
+  ]
+}}
+
+Company Policy Excerpts:
 {rag_text}
+
+Generate a comprehensive incident response plan with 5-8 steps for this {self.incident_types[incident_type]} using ONLY the above policy information. If the policy excerpts don't provide enough detail for certain steps, clearly indicate what additional information is needed from the company's procedures.
 """
+        logger.debug("Plan prompt prepared")
         try:
-            response = self.llm.invoke(plan_prompt)
-            plan_json = response.content if hasattr(response, "content") else response
-            import re, json
-            json_match = re.search(r'\[.*\]', plan_json, re.DOTALL)
-            if json_match:
-                steps_json = json.loads(json_match.group(0))
-                self.session_plan = steps_json
-            else:
-                self.session_plan = []
+            logger.debug("Before LLM call")
+            # Use structured output with Pydantic model
+            structured_llm = self.llm.with_structured_output(IncidentResponsePlan)
+            result = structured_llm.invoke(plan_prompt)
+            logger.debug("After LLM call")
+            logger.debug(f"LLM structured output: {result}")
+            
+            if not result.steps or len(result.steps) == 0:
+                logger.warning("No steps returned from LLM")
+                return f"[DEBUG] LLM returned no steps. Raw output: {result}"
+            
+            logger.info(f"Parsed {len(result.steps)} steps from LLM response")
+            self.session_plan = [{"title": step.title, "description": step.description} for step in result.steps]
+            incident_name = self.incident_types[incident_type]
+            total_steps = len(self.session_plan)
+            response = f"🚨 **INCIDENT RESPONSE ACTIVATED** 🚨\n\n"
+            response += f"**Incident Type:** {incident_name}\n"
+            response += f"**Total Steps:** {total_steps}\n"
+            response += f"**Incident Commander:** (see team roster)\n\n"
+            response += "**IMMEDIATE ACTION REQUIRED:**\n"
+            response += "1. Do NOT panic - follow the plan step by step\n"
+            response += "2. Confirm each step before proceeding to the next\n"
+            response += "3. Document all actions taken\n\n"
+            response += "Type 'next' to begin the response process.\n"
+            response += "Type 'team' to see the incident response team.\n"
+            response += "Type 'overview' to see the complete plan.\n"
+            logger.debug("Returning response to user")
+            return response
         except Exception as e:
-            self.session_plan = []
-            return f"Error generating plan: {e}"
-        incident_name = self.incident_types[incident_type]
-        response = f"🚨 **INCIDENT RESPONSE ACTIVATED** 🚨\n\n"
-        response += f"**Incident Type:** {incident_name}\n"
-        response += f"**Incident Commander:** (see team roster)\n\n"
-        response += "**IMMEDIATE ACTION REQUIRED:**\n"
-        response += "1. Do NOT panic - follow the plan step by step\n"
-        response += "2. Confirm each step before proceeding to the next\n"
-        response += "3. Document all actions taken\n\n"
-        response += "Type 'next' to begin the response process.\n"
-        response += "Type 'team' to see the incident response team.\n"
-        response += "Type 'overview' to see the complete plan.\n"
-        return response
+            logger.error(f"Exception in start_incident_response: {e}")
+            return f"Exception in start_incident_response: {e}"
 
     def get_current_step(self) -> tuple[str, bool]:
         if not self.session_plan or self.current_step >= len(self.session_plan):
@@ -327,13 +384,14 @@ You are an expert security consultant. Based on the following policy excerpts, g
         """Display the incident response team information using focused RAG and LLM prompt"""
         if self.rag_retriever and self.llm:
             # Use a more focused query
-            rag_docs = self.rag_retriever.retrieve("incident response team roster names roles responsibilities", top_k=10)
+            rag_docs = self.rag_retriever.retrieve("incident response team roster names roles responsibilities contact information", top_k=10)
             rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
             prompt = f"""
-You are an expert security consultant. Based on the following policy excerpts, extract ONLY the incident response team roster: names, roles, and main responsibilities. 
-DO NOT include any other information, best practices, or steps. 
-
-Return the output as a clear, readable roster. Do not include any text except the team roster.
+You are an expert security consultant. Using ONLY the information in the following policy excerpts, extract the incident response team roster: names, roles, main responsibilities, and contact information (if available).
+- Do NOT use any best practices, external knowledge, or invent any information.
+- If a field is missing, write 'No information available' for that field.
+- Return the output as a Markdown table with columns: Name, Role, Responsibility, Contact.
+- Only output the table. Do not include any other text.
 
 {rag_text}
 """
@@ -402,10 +460,42 @@ Return the output as a clear, readable roster. Do not include any text except th
         except Exception as e:
             return f"Error generating lessons learned: {e}"
 
+    def get_welcome_screen(self) -> str:
+        """Display the welcome screen with available simulation options"""
+        response = "🚨 **INCIDENT RESPONSE SIMULATION CENTER** 🚨\n\n"
+        response += "Welcome to the VCISO Incident Response Simulation System!\n\n"
+        response += "**Available Simulations:**\n"
+        response += "1. **Data Breach** - Simulate a data breach incident response\n"
+        response += "2. **Phishing Attack** - Simulate a phishing attack response\n"
+        response += "3. **Ransomware Attack** - Simulate a ransomware incident response\n\n"
+        response += "**To start a simulation, simply type:**\n"
+        response += "• `data_breach` (or `data breach`, `breach`)\n"
+        response += "• `phishing` (or `phish`)\n"
+        response += "• `ransomware` (or `ransom`)\n\n"
+        response += "**Other Commands:**\n"
+        response += "• `welcome` - Show this screen again\n"
+        response += "• `next` - Continue to next step (during simulation)\n"
+        response += "• `team` - View incident response team\n"
+        response += "• `overview` - See complete response plan\n"
+        response += "• `summary` - Generate post-incident summary\n"
+        response += "• `analysis` - Get detailed session analysis\n"
+        response += "• `lessons` - Extract lessons learned\n"
+        response += "• `clarify` - Get detailed explanation of current step\n\n"
+        response += "**Natural Language Support:**\n"
+        response += "You can also type natural phrases like:\n"
+        response += "• \"Start a phishing simulation\"\n"
+        response += "• \"Begin data breach response\"\n"
+        response += "• \"Launch ransomware incident\"\n\n"
+        response += "Ready to begin? Choose your simulation type!"
+        return response
+
     def process_incident_message(self, message: str, chat_history: Optional[list] = None) -> str:
         """Process user messages for incident response"""
+        logger.debug(f"Processing incident message: {message}")
         message = message.lower().strip()
-        if message == 'next':
+        if message == 'welcome':
+            return self.get_welcome_screen()
+        elif message == 'next':
             return self.confirm_step()
         elif message == 'team':
             return self.get_team_info()
@@ -419,14 +509,11 @@ Return the output as a clear, readable roster. Do not include any text except th
             return self.get_lessons_learned()
         elif message == 'clarify':
             return self.clarify_current_step()
-        elif message.startswith('start '):
-            incident_type = message.replace('start ', '').strip()
-            return self.start_incident_response(incident_type)
-        elif message.startswith('start_'):
-            incident_type = message.replace('start_', '').strip()
-            return self.start_incident_response(incident_type)
+        elif message in self.incident_types:
+            return self.start_incident_response(message)
         else:
             # Use LLM for free-form questions, with RAG context
+            logger.debug(f"Received message for free-form response: {message}")
             return self._llm_free_form_response(message, chat_history)
 
     def _llm_free_form_response(self, message: str, chat_history: Optional[list] = None) -> str:
@@ -478,7 +565,7 @@ class RAGDocumentLoader:
         self.documents = []
         self.chunks = []
         for path in glob.glob(os.path.join(self.folder, "*")):
-            logger.info(f"Processing document: {path}")
+            logger.debug(f"Processing document: {path}")
             if os.path.isdir(path):
                 continue  # Skip directories
             doc_name = os.path.basename(path)
@@ -494,7 +581,7 @@ class RAGDocumentLoader:
                 logger.warning(f"Unsupported file extension for document: {doc_name}")
         logger.info(f"Loaded {len(self.chunks)} document chunks.")
         if self.chunks:
-            logger.info(f"First chunk: {self.chunks[0]}")
+            logger.debug(f"First chunk: {self.chunks[0]}")
 
     def _load_pdf(self, path, doc_name):
         try:
@@ -606,6 +693,68 @@ class VisoPart3:
         self.search_tool = TavilySearch(max_results=3, max_tokens=MAX_TOKENS)
         self.incident_guide.set_llm(self.llm)
 
+    def normalize_command(self, message: str) -> str:
+        """Normalize user input by stripping common phrases and mapping variations"""
+        message = message.lower().strip()
+        
+        # Handle special cases first
+        if any(phrase in message for phrase in ['start a simulation', 'start simulation', 'begin simulation', 'launch simulation']):
+            return 'welcome'
+        
+        # Strip common phrases
+        phrases_to_remove = [
+            'start', 'initiate', 'begin', 'launch', 'run', 'execute',
+            'simulation', 'simulate', 'a simulation', 'the simulation',
+            'incident', 'response', 'incident response'
+        ]
+        
+        for phrase in phrases_to_remove:
+            message = message.replace(phrase, '').strip()
+        
+        # Remove extra whitespace and punctuation
+        message = re.sub(r'\s+', ' ', message).strip()
+        message = message.strip('.,!?')
+        
+        # If we're left with just "a" or empty, return welcome
+        if message in ['a', 'the', '']:
+            return 'welcome'
+        
+        # Map variations to standard commands
+        command_mapping = {
+            # Incident types
+            'data breach': 'data_breach',
+            'databreach': 'data_breach',
+            'breach': 'data_breach',
+            'phishing': 'phishing',
+            'phish': 'phishing',
+            'ransomware': 'ransomware',
+            'ransom': 'ransomware',
+            
+            # Command variations
+            'welcome': 'welcome',
+            'help': 'welcome',
+            'menu': 'welcome',
+            'next': 'next',
+            'continue': 'next',
+            'proceed': 'next',
+            'team': 'team',
+            'roster': 'team',
+            'members': 'team',
+            'overview': 'overview',
+            'plan': 'overview',
+            'summary': 'summary',
+            'report': 'summary',
+            'analysis': 'analysis',
+            'analyze': 'analysis',
+            'lessons': 'lessons',
+            'learned': 'lessons',
+            'clarify': 'clarify',
+            'explain': 'clarify',
+            'details': 'clarify'
+        }
+        
+        return command_mapping.get(message, message)
+
     def process_message(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         """Process user messages for both RAG analysis and incident response"""
         if not self.llm:
@@ -617,17 +766,23 @@ class VisoPart3:
             return ("Session limit reached. Please restart the app to continue. "
                     "This is to prevent excessive usage and potential infinite loops.")
         
+        # Normalize the command
+        normalized_message = self.normalize_command(message)
+        logger.debug(f"Original message: '{message}' -> Normalized: '{normalized_message}'")
+        
         # Check if this is an incident response command
-        if message.lower().strip() in ['next', 'team', 'overview', 'summary', 'analysis', 'lessons', 'clarify'] or message.lower().startswith('start '):
-            return self.incident_guide.process_incident_message(message, history)
+        if (normalized_message in ['welcome', 'next', 'team', 'overview', 'summary', 'analysis', 'lessons', 'clarify'] or 
+            normalized_message in self.incident_guide.incident_types):
+            return self.incident_guide.process_incident_message(normalized_message, history)
+        logger.debug(f"Processing message: {normalized_message}")
         
         # Check if this is a section analysis request
-        section = self._find_section(message)
+        section = self._find_section(normalized_message)
         if section:
             return self._analyze_section(section)
         
         # Default to RAG-based policy analysis
-        return self._process_policy_analysis(message, history)
+        return self._process_policy_analysis(normalized_message, history)
 
     def _find_section(self, user_input: str) -> Optional[str]:
         """Find if user input matches any main section"""
@@ -689,3 +844,4 @@ Provide a comprehensive, helpful response based on the documents and security be
             report += recommendation + "\n\n"
         
         return report
+
