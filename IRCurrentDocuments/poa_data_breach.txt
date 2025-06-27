@@ -1,0 +1,53 @@
+Plan of Action: Data Breach (General, Non-Ransomware)
+I. Immediate Response (Detection & Containment)
+
+Confirm Breach: Verify the legitimacy of the suspected data breach.
+
+Scope Assessment: Determine the type of data compromised (e.g., PII, financial, intellectual property), the number of individuals affected, and the systems involved.
+
+Containment: Isolate affected systems, revoke unauthorized access, and implement emergency patches to close the vulnerability exploited. Preserve logs and forensic evidence.
+
+Activate IRT: Engage the full Incident Response Team, including legal counsel and public relations.
+
+II. Investigation & Analysis
+
+Forensic Investigation: Conduct a thorough forensic analysis to understand how the breach occurred, the extent of data accessed/exfiltrated, and the attacker's methods.
+
+Evidence Collection: Securely collect and preserve all relevant logs, system images, and other digital evidence.
+
+Root Cause Analysis: Identify the specific vulnerability or human error that led to the breach.
+
+III. Notification & Communication
+
+Legal & Regulatory Assessment: Consult with legal counsel to understand breach notification obligations based on jurisdiction (e.g., GDPR, CCPA, HIPAA) and the type of data affected.
+
+Notify Authorities: Inform relevant regulatory bodies and law enforcement as required by law.
+
+Notify Affected Individuals: Prepare and issue breach notification letters/emails to affected individuals as per legal requirements, offering credit monitoring or other protective services if appropriate.
+
+Public Relations: Develop a clear and transparent communication strategy for internal and external stakeholders, including media statements, FAQs, and dedicated support channels.
+
+IV. Eradication & Recovery
+
+Remediate Vulnerabilities: Fully eradicate the threat by patching the identified vulnerabilities, strengthening security configurations, and removing any backdoor access.
+
+System Restoration: Restore affected systems from clean backups if necessary.
+
+Enhanced Monitoring: Implement enhanced monitoring on affected systems and data to detect any further suspicious activity.
+
+V. Post-Incident & Improvement
+
+Post-Mortem Review: Conduct a detailed review of the incident to identify areas for improvement in security posture and incident response processes.
+
+Security Enhancements: Implement long-term security enhancements, which may include:
+
+Improved data encryption.
+
+Stronger access controls and data loss prevention (DLP) solutions.
+
+Regular security audits and penetration testing.
+
+Enhanced employee training on data handling and security best practices.
+
+Update Plans: Revise the incident response plan and relevant security policies based on lessons learned.
+

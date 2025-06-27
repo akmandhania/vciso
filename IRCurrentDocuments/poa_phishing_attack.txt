@@ -1,0 +1,50 @@
+Plan of Action: Phishing Attack Leading to Credential Compromise
+I. Immediate Response (Detection & Containment)
+
+Report & Isolate: User reports suspicious email/activity. The user should not click links or open attachments. IT/Security isolates the user's device from the network.
+
+Verify Compromise:
+
+Check for unusual login attempts, unauthorized access to accounts (email, cloud services, internal systems).
+
+Review email logs for suspicious outbound emails.
+
+Contain Affected Accounts:
+
+Immediately reset passwords for the compromised user account and any associated accounts.
+
+If MFA is not enabled, enable it immediately for the compromised account and promote it widely.
+
+Review and revoke any suspicious API keys or OAuth tokens granted by the compromised account.
+
+Block Malicious Indicators: Add sender email addresses, domains, and IP addresses from the phishing campaign to blocklists.
+
+II. Investigation & Eradication
+
+Forensic Scan: Perform a comprehensive scan of the user's device for malware or other malicious software.
+
+Identify Data Exfiltration: Determine if any sensitive data was accessed or exfiltrated.
+
+Communicate Internally: Alert all employees about the phishing campaign, providing examples of the malicious email and reminding them of reporting procedures.
+
+Remove Malicious Content: Delete the phishing email from all user inboxes where it was received.
+
+III. Recovery & Prevention
+
+Restore Access: Once systems are clean and passwords reset, restore the user's access.
+
+Reinforce Training:
+
+Provide immediate, targeted security awareness training to the affected user.
+
+Conduct organization-wide refresher training on phishing recognition and reporting.
+
+Run simulated phishing campaigns regularly.
+
+Enhance Email Security:
+
+Review and strengthen email gateway rules and spam filters.
+
+Implement DMARC, DKIM, and SPF to prevent email spoofing.
+
+Review Access Controls: Regularly review user permissions and access levels to ensure least privilege.

@@ -1,0 +1,59 @@
+Plan of Action: Ransomware Attack
+I. Immediate Response (Containment)
+
+Isolate Infected Systems: Immediately disconnect affected systems from the network (unplug network cables, disable Wi-Fi). Do NOT shut down infected machines until forensic experts advise, as this can destroy volatile evidence.
+
+Identify Scope: Determine which systems are infected, the strain of ransomware, and the initial point of compromise (if evident).
+
+Activate IRT: Notify the Incident Response Team (IT, Security, Legal, Management).
+
+Secure Backups: Ensure all valid, isolated backups are safe and inaccessible to the ransomware. Verify their integrity.
+
+II. Investigation & Eradication
+
+Forensic Analysis: Engage cybersecurity forensics experts to investigate the attack, identify the attack vector, and understand the full extent of the compromise.
+
+Eradicate Ransomware:
+
+Remove ransomware from all infected systems.
+
+Patch all exploited vulnerabilities that allowed the ransomware to enter.
+
+Reset all compromised user accounts and credentials.
+
+Implement stronger access controls and MFA if not already in place.
+
+No Ransom Payment (General Policy): Advise against paying the ransom as it does not guarantee data recovery and encourages future attacks. This should be a pre-determined policy.
+
+III. Recovery
+
+Prioritize Recovery: Identify mission-critical systems and data that need to be restored first based on business impact.
+
+Restore from Backups:
+
+Use verified clean backups to restore data and systems.
+
+Restore in a segmented or clean environment first to ensure no re-infection.
+
+Verify data integrity after restoration.
+
+Rebuild Systems: For systems that cannot be safely restored, perform clean installations and reconfigure from scratch.
+
+Monitor Post-Recovery: Continuously monitor all restored systems for any signs of lingering malicious activity.
+
+IV. Post-Incident & Prevention
+
+Lessons Learned: Conduct a thorough post-mortem to identify weaknesses and improve defenses.
+
+Enhance Security:
+
+Strengthen endpoint protection and network segmentation.
+
+Implement robust email security filters.
+
+Increase security awareness training focusing on phishing (a common ransomware vector).
+
+Regularly review and update backup and recovery strategies.
+
+Consider implementing an Endpoint Detection and Response (EDR) solution.
+

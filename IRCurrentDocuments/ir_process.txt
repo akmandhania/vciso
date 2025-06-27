@@ -1,0 +1,132 @@
+Incident Response Process (NIST Framework)
+
+A. Preparation
+
+Risk Assessment: Identify critical assets, potential threats, and vulnerabilities.
+
+Security Controls: Implement preventative measures (MFA, firewalls, EDR, regular patching).
+
+Backup Strategy: Implement and regularly test a robust backup and recovery plan (e.g., 3-2-1 rule: 3 copies, 2 different media, 1 offsite/isolated).
+
+Training & Awareness: Regular security training for all employees, incident response drills (tabletop exercises).
+
+Tools & Resources:
+
+Incident management platform/ticketing system.
+
+Forensic tools.
+
+Secure communication channels (out-of-band for compromised systems).
+
+Contact lists for external experts (forensic investigators, legal, PR).
+
+Documentation: Maintain up-to-date asset inventories, network diagrams, and emergency contacts.
+
+B. Detection & Analysis
+
+Monitoring: Implement continuous monitoring (SIEM, IDS/IPS, endpoint monitoring) to detect anomalies.
+
+Initial Triage:
+
+Confirm the incident (is it a false positive?).
+
+Gather initial information (what happened, when, where, who reported).
+
+Determine severity and potential impact.
+
+Activate the IRT based on severity.
+
+Analysis:
+
+Collect and analyze logs (system, network, application).
+
+Identify indicators of compromise (IOCs).
+
+Determine the root cause, attack vector, and scope of the breach.
+
+Preserve evidence for forensic analysis.
+
+C. Containment
+
+Short-Term Containment:
+
+Isolate affected systems/networks (disconnect from network, disable compromised accounts).
+
+Prevent further spread of the attack.
+
+Implement temporary workarounds if necessary to maintain critical business functions.
+
+Long-Term Containment:
+
+Implement permanent solutions to prevent re-infection.
+
+Patch vulnerabilities.
+
+Enhance security controls.
+
+D. Eradication & Recovery
+
+Eradication:
+
+Remove the root cause of the incident (e.g., malware, malicious scripts, backdoor access).
+
+Clean infected systems.
+
+Reset compromised credentials.
+
+Recovery:
+
+Restore systems and data from clean backups.
+
+Verify system integrity and functionality.
+
+Monitor closely for any signs of re-infection.
+
+Gradually bring systems back online, prioritizing critical services.
+
+E. Post-Incident Activity (Lessons Learned)
+
+Review & Analysis:
+
+Conduct a post-mortem meeting with the IRT.
+
+Analyze what went well, what could be improved.
+
+Review the effectiveness of the response plan and implemented controls.
+
+Document the incident thoroughly (timeline, actions taken, impact).
+
+Actionable Improvements:
+
+Update incident response plan, policies, and procedures.
+
+Identify new security measures or training needs.
+
+Share lessons learned with relevant teams.
+
+IV. Communication Plan
+
+Internal Communication:
+
+Reporting procedures for employees to report suspicious activity.
+
+Communication to internal stakeholders (leadership, employees).
+
+External Communication:
+
+Notification requirements (regulatory bodies, affected individuals, law enforcement).
+
+Public statements (press releases, social media).
+
+Coordination with legal and PR.
+
+V. Appendices
+
+Contact List (Internal & External)
+
+Threat Classification Guide
+
+Severity Level Definitions
+
+Checklists for each phase (Detection, Containment, Recovery)
+

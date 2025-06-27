@@ -1,0 +1,36 @@
+Incident Response Team Roster
+Team Lead & Coordinator
+Name: Olivia Chen
+Role: Incident Commander
+Main Responsibility: Oversees the entire incident response process, makes critical decisions, ensures clear communication between all team members and stakeholders, and ultimately signs off on the resolution and post-mortem report. She's the orchestrator.
+
+Technical Experts
+Name: Ben Carter
+Role: Lead Security Analyst / Forensic Specialist
+Main Responsibility: Conducts in-depth technical analysis of security incidents, identifies attack vectors and indicators of compromise (IOCs), performs forensic investigations, and leads the eradication efforts. He's the technical Sherlock Holmes.
+
+Name: Sarah Jenkins
+Role: Network & Systems Engineer
+Main Responsibility: Focuses on network isolation and containment strategies, system restoration, patching vulnerabilities, and ensuring the integrity of infrastructure during and after an incident. She keeps the lights on, securely.
+
+Name: David Lee
+Role: Cloud Security Specialist
+Main Responsibility: Manages security incidents specifically within cloud environments (e.g., AWS, Azure, GCP), including monitoring cloud logs, securing cloud configurations, and restoring cloud-based applications and data. He's the cloud guardian.
+
+Support & Liaison Roles
+Name: Emily Davis
+Role: Legal Counsel / Compliance Officer
+Main Responsibility: Advises the team on legal and regulatory obligations, handles data breach notifications, ensures compliance with privacy laws, and manages any potential legal ramifications. She ensures the team plays by the rules.
+
+Name: Mark Thompson
+Role: Communications & Public Relations Lead
+Main Responsibility: Drafts and disseminates internal and external communications during an incident, manages media inquiries, and works to protect the company's reputation. He's the voice of the company during a crisis.
+
+Name: Jessica White
+Role: Human Resources Liaison
+Main Responsibility: Addresses any personnel-related issues arising from an incident, such as compromised employee accounts, insider threat concerns, or employee support during stressful situations. She looks after the people side of things.
+
+Name: Robert Miller
+Role: Business Continuity & Operations Liaison
+Main Responsibility: Represents affected business units, helps prioritize the recovery of critical business functions, assesses operational impact, and works to minimize disruption to core services. He keeps the business running as smoothly as possible.
+
