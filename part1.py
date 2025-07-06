@@ -4,6 +4,7 @@ from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from opik.integrations.langchain import OpikTracer
 import gradio as gr
 import os
 import logging
@@ -12,6 +13,9 @@ import json
 # Set up logger for debug output
 logger = logging.getLogger("vciso.part1")
 logging.basicConfig(level=logging.INFO)
+
+# Configuration flags
+ENABLE_OPIK_TRACING = False  # Set to True to enable Opik tracing
 
 MAX_TOKENS = 1024  # Limit for TavilySearch and any LLM calls
 MAX_INTERACTIONS = 30  # Max number of user interactions per session
@@ -118,7 +122,16 @@ class IRPChatHandler:
 
         self._advance_section_if_needed(message)
         graph_state = self._build_graph_state(chat_history, last_plan)
-        result = graph.invoke(graph_state)
+        
+        # Prepare config with conditional Opik tracer
+        config = {}
+        if hasattr(graph, 'opik_tracer') and graph.opik_tracer:
+            config["callbacks"] = [graph.opik_tracer]
+            logger.debug("Using Opik tracer for this query")
+        else:
+            logger.debug("Opik tracer not used for this query")
+        
+        result = graph.invoke(graph_state, config=config)
         llm_message = self._parse_llm_output(result)
 
         options_msg = ("\n\nOptions: Type 'overview' for a summary, 'download' to save your plan, "
@@ -242,6 +255,7 @@ class VisoPart1:
         self.llm = None
         self.graph = None
         self.search_tool = None
+        self.opik_tracer = None
         self.state = {
             'interaction_count': 0,
             'last_plan': '',
@@ -265,6 +279,18 @@ class VisoPart1:
         graph.add_edge(START, "llm_interact")
         graph.add_edge("llm_interact", END)
         self.graph = graph.compile()
+
+        # Initialize Opik tracer only if enabled
+        if ENABLE_OPIK_TRACING:
+            self.opik_tracer = OpikTracer(graph=self.graph.get_graph(xray=True))
+            logger.info("Opik tracing enabled")
+        else:
+            self.opik_tracer = None
+            logger.info("Opik tracing disabled")
+
+        # Attach the tracer to the graph for the handler to access
+        self.graph.opik_tracer = self.opik_tracer
+        
         self.handler = IRPChatHandler(self.llm, self.search_tool, self.state)
 
     def llm_node(self, state: IRPBuilderState):
@@ -313,4 +339,7 @@ class VisoPart1:
         return path
 
     def process_message(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        return self.handler.process(message, history, self.graph, self.state.get('last_plan', ''), self._create_download)
+        logger.info(f"Processing message: {message}")
+        result = self.handler.process(message, history, self.graph, self.state.get('last_plan', ''), self._create_download)
+        logger.info(f"IRP builder completed. Response length: {len(result)}")
+        return result

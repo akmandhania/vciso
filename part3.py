@@ -1,24 +1,42 @@
 import os
 import glob
 import json
-import re
 import logging
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, TypedDict
 import chromadb
-from chromadb.config import Settings
 import PyPDF2
 import docx
 from bs4 import BeautifulSoup
-from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from chromadb.utils import embedding_functions
+from opik.integrations.langchain import OpikTracer
 from pydantic import BaseModel
-from langchain_core.output_parsers import PydanticOutputParser
+import difflib
+
+# Command constants
+CMD_NEXT = "next"
+CMD_CLARIFY = "clarify"
+CMD_COMPLETE = "complete"
+CMD_SUMMARY = "summary"
+CMD_ANALYSIS = "analysis"
+CMD_LESSONS = "lessons"
+CMD_DOWNLOAD = "download"
+CMD_TEAM = "team"
+CMD_OVERVIEW = "overview"
+CMD_HELP = "help"
+CMD_WELCOME = "welcome"
+CMD_START = "start"
+
+# User instruction string constants
+INSTRUCTION_STEP = (
+    f"Type '{CMD_NEXT}' to proceed, '{CMD_CLARIFY}' for detailed guidance, or '{CMD_COMPLETE}' to finish all steps and move to post-incident analysis."
+)
+INSTRUCTION_NO_SESSION = "No active incident response session. Please select an incident type first."
+INSTRUCTION_SUMMARY = f"Type '{CMD_SUMMARY}' for session summary or '{CMD_ANALYSIS}' for detailed analysis."
+INSTRUCTION_ALL_STEPS_DONE = f"All incident response steps completed! {INSTRUCTION_SUMMARY}"
 
 # Disable ChromaDB telemetry
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
@@ -29,6 +47,9 @@ logging.getLogger("chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2").setLe
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configuration flags
+ENABLE_OPIK_TRACING = False  # Set to True to enable Opik tracing
 
 # Suppress third-party library logs at INFO level
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -198,26 +219,10 @@ Focus on:
 
 ## STRATEGIC INSIGHTS
 - Long-term planning implications
-- Resource allocation insights
-- Risk management improvements
+- Resource allocation recommendations
+- Technology investment priorities
 
-Provide actionable, specific lessons with clear implementation guidance.
-"""
-
-ANALYSIS_PROMPT = """
-You are an expert security consultant. The user has selected the '{section}' section of their Incident Response Plan for review.
-
-Here are the relevant excerpts from their existing policy documents:
-{rag_docs}
-
-Based on these documents, please perform a gap analysis against industry best practices for the '{section}' section.
-
-Your response should include:
-1.  A summary of the current state of their policy for this section based on the documents provided.
-2.  A list of identified gaps when compared to industry best practices.
-3.  A comprehensive, actionable list of recommendations for changes to their policy documents. These recommendations should be clear and detailed enough for someone to implement them.
-
-If no relevant documents are found, please state that and provide recommendations for what should be included in this section from scratch, based on best practices.
+Provide actionable insights with clear next steps.
 """
 
 class DocumentChunk(TypedDict):
@@ -233,306 +238,453 @@ class IncidentStep(BaseModel):
 class IncidentResponsePlan(BaseModel):
     steps: List[IncidentStep]
 
+class IncidentResponseState(TypedDict):
+    """State for the incident response workflow."""
+    user_message: str
+    incident_type: Optional[str]
+    current_step_index: int
+    incident_plan: Optional[IncidentResponsePlan]
+    session_history: List[Dict[str, str]]
+    team_members: List[str]
+    current_step_text: str
+    response_result: str
+    interaction_count: int
+    command_type: Optional[str]
+
 class IncidentResponseGuide:
-    """Interactive incident response guidance system (RAG-only, no direct file parsing)"""
-    
+    """
+    Guides the user through an incident response workflow, using LLM and RAG for step-by-step guidance, team info, and post-incident analysis.
+    Supports commands for starting, progressing, clarifying, completing, and analyzing incident response sessions.
+    """
     def __init__(self, rag_retriever=None):
-        self.incident_types = {
-            "data_breach": "Data Breach",
-            "phishing": "Phishing Attack", 
-            "ransomware": "Ransomware Attack"
-        }
-        self.current_incident = None
-        self.current_step = 0
-        self.step_responses = []
-        self.llm = None  # Will be set by VisoPart3
+        """
+        Initialize the guide with optional RAG retriever for document-based answers.
+        Sets up incident types, team members, and session state.
+        """
+        self.llm = None
         self.rag_retriever = rag_retriever
-        self.session_plan = None  # LLM-generated plan for the current session
-        self.team_members = {}  # Optionally, can be filled by RAG as well
+        self.incident_types = [
+            "Data Breach",
+            "Ransomware Attack",
+            "Phishing Campaign",
+            "DDoS Attack",
+            "Insider Threat",
+            "Malware Infection",
+            "Social Engineering",
+            "Physical Security Breach",
+            "Zero-Day Exploit",
+            "Supply Chain Attack",
+            "Credential Compromise",
+            "Web Application Attack",
+            "Insider Misuse",
+            "Physical Theft or Loss",
+            "Data Leakage",
+            "Business Email Compromise",
+            "Rogue Device",
+            "Advanced Persistent Threat",
+            "Malicious Code Injection",
+            "Social Media Account Compromise",
+            "Third-Party Service Outage"
+        ]
+        self.team_members = [
+            "Incident Response Lead",
+            "Security Analyst",
+            "Network Administrator",
+            "System Administrator",
+            "Legal Counsel",
+            "Communications Officer",
+            "Forensic Investigator",
+            "IT Support"
+        ]
+        self.current_incident_type = None
+        self.incident_plan = None
+        self.current_step_index = 0
+        self.session_history = []
 
     def set_llm(self, llm):
+        """Set the language model to use for all LLM-based responses."""
         self.llm = llm
 
     def set_rag_retriever(self, rag_retriever):
+        """Set the retriever for retrieving policy/team info from ingested documents."""
         self.rag_retriever = rag_retriever
 
+    def _format_step(self, step_index: int, total_steps: int, step: 'IncidentStep') -> str:
+        """
+        Helper to format the current step with 'Step X of N', bold title, and description.
+        """
+        return (
+            f"### ▶️ Step {step_index + 1} of {total_steps}: <b>{step.title}</b>\n"
+            f"<i>{step.description}</i>\n"
+        )
+
     def start_incident_response(self, incident_type: str) -> str:
-        logger.info(f"Entered start_incident_response for: {incident_type}")
-        incident_type = incident_type.lower().strip()
-        if incident_type not in self.incident_types:
-            logger.warning(f"Invalid incident type: {incident_type}")
-            return "Invalid incident type. Please choose from: data_breach, phishing, ransomware"
-        logger.debug("Set incident type, step, responses")
-        self.current_incident = incident_type
-        self.current_step = 0
-        self.step_responses = []
-        logger.debug("About to retrieve RAG docs")
-        rag_docs = self.rag_retriever.retrieve(incident_type, top_k=10) if self.rag_retriever else []
-        logger.info(f"RAG docs retrieved: {len(rag_docs)}")
-        rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
-        logger.debug("RAG text prepared")
+        """
+        Start a new incident response session for the given incident type.
+        Generates a step-by-step plan using the LLM and resets session state.
+        """
+        incident_type = incident_type.strip().lower()
+        matched = None
+        for valid in self.incident_types:
+            if incident_type in valid.lower():
+                matched = valid
+                break
+        if not matched:
+            return f"Invalid incident type. Please choose from: {', '.join(self.incident_types)}"
+        self.current_incident_type = matched
+        self.current_step_index = 0
+        self.session_history = []
         plan_prompt = f"""
-You are an expert security consultant. Based ONLY on the following company policy excerpts, generate a step-by-step incident response plan for a {self.incident_types[incident_type]}.
-
-IMPORTANT: Use ONLY the information provided in the policy excerpts below. Do NOT use any external knowledge, best practices, or general security expertise. If the policy excerpts don't contain enough information for a complete plan, indicate what information is missing.
-
-Create a structured response with a list of steps. Each step should have a clear title and detailed description based solely on the company's documented procedures.
-
-The response should be structured as a JSON object with a "steps" array containing objects with "title" and "description" fields.
-
-Example format:
-{{
-  "steps": [
-    {{
-      "title": "Immediate Containment",
-      "description": "Based on company policy: [specific procedure from documents]..."
-    }},
-    {{
-      "title": "Evidence Preservation", 
-      "description": "According to company procedures: [specific steps from documents]..."
-    }}
-  ]
-}}
-
-Company Policy Excerpts:
-{rag_text}
-
-Generate a comprehensive incident response plan with 5-8 steps for this {self.incident_types[incident_type]} using ONLY the above policy information. If the policy excerpts don't provide enough detail for certain steps, clearly indicate what additional information is needed from the company's procedures.
-"""
-        logger.debug("Plan prompt prepared")
-        try:
-            logger.debug("Before LLM call")
-            # Use structured output with Pydantic model
-            structured_llm = self.llm.with_structured_output(IncidentResponsePlan)
-            result = structured_llm.invoke(plan_prompt)
-            logger.debug("After LLM call")
-            logger.debug(f"LLM structured output: {result}")
-            
-            if not result.steps or len(result.steps) == 0:
-                logger.warning("No steps returned from LLM")
-                return f"[DEBUG] LLM returned no steps. Raw output: {result}"
-            
-            logger.info(f"Parsed {len(result.steps)} steps from LLM response")
-            self.session_plan = [{"title": step.title, "description": step.description} for step in result.steps]
-            incident_name = self.incident_types[incident_type]
-            total_steps = len(self.session_plan)
-            response = f"🚨 **INCIDENT RESPONSE ACTIVATED** 🚨\n\n"
-            response += f"**Incident Type:** {incident_name}\n"
-            response += f"**Total Steps:** {total_steps}\n"
-            response += f"**Incident Commander:** (see team roster)\n\n"
-            response += "**IMMEDIATE ACTION REQUIRED:**\n"
-            response += "1. Do NOT panic - follow the plan step by step\n"
-            response += "2. Confirm each step before proceeding to the next\n"
-            response += "3. Document all actions taken\n\n"
-            response += "Type 'next' to begin the response process.\n"
-            response += "Type 'team' to see the incident response team.\n"
-            response += "Type 'overview' to see the complete plan.\n"
-            logger.debug("Returning response to user")
-            return response
-        except Exception as e:
-            logger.error(f"Exception in start_incident_response: {e}")
-            return f"Exception in start_incident_response: {e}"
+        Create a comprehensive incident response plan for a {matched} incident.
+        Break down the response into specific, actionable steps.
+        """
+        structured_llm = self.llm.with_structured_output(IncidentResponsePlan)
+        result = structured_llm.invoke(plan_prompt)
+        self.incident_plan = result
+        num_steps = len(self.incident_plan.steps) if self.incident_plan and self.incident_plan.steps else 0
+        step = self.incident_plan.steps[0] if num_steps > 0 else None
+        step_block = self._format_step(0, num_steps, step) if step else ''
+        return (
+            f"## 🚦 Incident Response Session Started\n"
+            f"Incident type: **{matched}**  \n"
+            f"Number of steps: **{num_steps}**\n"
+            f"---\n"
+            f"{step_block}"
+            f"\n---\n"
+            f"{INSTRUCTION_STEP}"
+        )
 
     def get_current_step(self) -> tuple[str, bool]:
-        if not self.session_plan or self.current_step >= len(self.session_plan):
-            return "All steps completed. Type 'summary' to see the response summary.", True
-        step = self.session_plan[self.current_step]
-        response = f"**Step {self.current_step + 1}: {step.get('title', 'Untitled')}**\n\n"
-        response += f"{step.get('description', '')}\n\n"
-        response += "**Action Required:** Please confirm that you have completed this step.\n"
-        response += "Type 'next' when ready to proceed to the next step.\n"
-        response += "Type 'clarify' if you need more details about this step.\n"
-        return response, False
+        """Return the current step's title and whether a session is active."""
+        if not self.incident_plan or self.current_step_index >= len(self.incident_plan.steps):
+            return "No active incident response session.", False
+        
+        step = self.incident_plan.steps[self.current_step_index]
+        return step.title, True
 
     def confirm_step(self) -> str:
-        if not self.session_plan or self.current_step >= len(self.session_plan):
-            return "All steps have been completed. Type 'summary' to see the response summary."
-        step = self.session_plan[self.current_step]
-        self.step_responses.append({
-            'step': self.current_step + 1,
-            'title': step.get('title', ''),
-            'status': 'completed'
+        """
+        Mark the current step as completed and move to the next step.
+        Updates session history and returns the next step or completion message.
+        """
+        if not self.incident_plan:
+            return INSTRUCTION_NO_SESSION
+        
+        if self.current_step_index >= len(self.incident_plan.steps):
+            # Use the same detailed message as complete_steps
+            return (
+                "✅ All incident response steps are now completed for this incident!\n"
+                "You can now use the following commands to review and analyze the session:\n"
+                "- 'summary' — Get a session summary\n"
+                "- 'analysis' — Get a detailed session analysis\n"
+                "- 'lessons' — Extract lessons learned\n"
+                "- 'download' — Save the session analysis to a file\n"
+                "To start a new incident, type 'start [incident_type]'."
+            )
+        
+        current_step = self.incident_plan.steps[self.current_step_index]
+        
+        # Add to session history
+        self.session_history.append({
+            "role": "system",
+            "content": f"Completed step: {current_step.title}"
         })
-        self.current_step += 1
-        if self.current_step >= len(self.session_plan):
-            return "✅ **All steps completed!**\n\nType 'summary' to see the complete incident response summary."
-        else:
-            next_step, _ = self.get_current_step()
-            return f"✅ **Step {self.current_step} completed successfully!**\n\n{next_step}"
+        
+        self.current_step_index += 1
+        
+        if self.current_step_index >= len(self.incident_plan.steps):
+            return INSTRUCTION_ALL_STEPS_DONE
+        
+        next_step = self.incident_plan.steps[self.current_step_index]
+        num_steps = len(self.incident_plan.steps)
+        step_block = self._format_step(self.current_step_index, num_steps, next_step)
+        return (
+            f"Step completed. Moving to next step:\n"
+            f"{step_block}"
+            f"\n{INSTRUCTION_STEP}"
+        )
 
     def get_plan_overview(self) -> str:
-        if not self.session_plan:
-            return "No plan available for this incident."
-        response = f"**INCIDENT RESPONSE PLAN OVERVIEW**\n\n"
-        response += f"**Incident Type:** {self.incident_types.get(self.current_incident, 'Unknown')}\n\n"
-        for i, step in enumerate(self.session_plan):
-            response += f"**Step {i+1}:** {step.get('title', 'Untitled')}\n  {step.get('description', '')[:80]}...\n"
-        return response
+        """Return a checklist-style overview of the current incident response plan and progress."""
+        if not self.incident_plan:
+            return "No active incident response plan."
+        
+        overview = f"## Incident Response Plan: {self.current_incident_type}\n"
+        for i, step in enumerate(self.incident_plan.steps):
+            status = "✓" if i < self.current_step_index else "○"
+            overview += f"{status} Step {i+1}: {step.title}\n"
+        
+        return overview
 
     def clarify_current_step(self) -> str:
-        if not self.session_plan or self.current_step >= len(self.session_plan):
-            return "No current step to clarify."
-        step = self.session_plan[self.current_step]
-        prompt = INCIDENT_CLARIFY_PROMPT.format(step_text=f"{step.get('title', '')}: {step.get('description', '')}")
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        except Exception as e:
-            return f"Error generating clarification: {e}"
+        """
+        Provide detailed, step-by-step guidance for the current step using the LLM.
+        """
+        if not self.incident_plan or self.current_step_index >= len(self.incident_plan.steps):
+            return "No active step to clarify."
+        
+        current_step = self.incident_plan.steps[self.current_step_index]
+        step_text = f"{current_step.title}: {current_step.description}"
+        
+        prompt = ChatPromptTemplate.from_template(INCIDENT_CLARIFY_PROMPT)
+        chain = prompt | self.llm | StrOutputParser()
+        
+        clarification = chain.invoke({"step_text": step_text})
+        return f"## Detailed Guidance for Current Step\n{clarification}"
 
     def get_team_info(self) -> str:
-        """Display the incident response team information using focused RAG and LLM prompt"""
-        if self.rag_retriever and self.llm:
-            # Use a more focused query
-            rag_docs = self.rag_retriever.retrieve("incident response team roster names roles responsibilities contact information", top_k=10)
-            rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
-            prompt = f"""
-You are an expert security consultant. Using ONLY the information in the following policy excerpts, extract the incident response team roster: names, roles, main responsibilities, and contact information (if available).
-- Do NOT use any best practices, external knowledge, or invent any information.
-- If a field is missing, write 'No information available' for that field.
-- Return the output as a Markdown table with columns: Name, Role, Responsibility, Contact.
-- Only output the table. Do not include any other text.
-
-{rag_text}
-"""
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        return "No team information available."
+        """
+        Retrieve and display the team roster (names, roles, responsibilities, and contact info if present) from ingested policy documents.
+        Uses the LLM to extract and format as a visually aligned table for best readability in the UI.
+        Ensures the full, untruncated document context is sent to the LLM. Falls back to a static list if no document is found or LLM fails.
+        """
+        if self.rag_retriever:
+            roster_docs = self.rag_retriever.retrieve(
+                "incident response team roster names roles responsibilities contact info", top_k=10
+            )
+            if roster_docs and self.llm:
+                combined_content = "\n".join(doc['content'] for doc in roster_docs)
+                prompt = (
+                    "Extract every team member from the following text, regardless of formatting or length. "
+                    "If any contact information (such as email or phone) is present for a team member, include a 'Contact Info' column in the table; otherwise, omit the column. "
+                    "Output the result as a valid Markdown table (using | and --- for headers and separators). "
+                    "Do not include any explanation, closing remarks, or extra lines—output only the Markdown table.\n"
+                    f"{combined_content}"
+                )
+                response = self.llm.invoke(prompt)
+                table = response.content if hasattr(response, "content") else str(response)
+                table = table.strip()
+                # Strict post-processing: ensure Markdown table format
+                if table.startswith('|') and ('|---' in table):
+                    return "## Incident Response Team Roster (from policy documents)\n" + table
+                # Fallback to static Markdown table if not compliant
+        # Fallback to static list if nothing found or LLM fails
+        team_info = "## Incident Response Team\n"
+        team_info += "| Name | Role |\n|---|---|\n"
+        for member in self.team_members:
+            team_info += f"| {member} | |\n"
+        team_info += "\nEach team member has specific responsibilities during incident response."
+        return team_info
 
     def get_summary(self) -> str:
-        """Generate comprehensive post-incident summary using LLM and RAG"""
-        if not self.step_responses:
-            return "No incident response session to summarize."
-        # Retrieve team info via RAG
-        team_info = self.get_team_info()
-        # Prepare session data
-        history_text = "\n".join([
-            f"Step {item['step']}: {item.get('title', '')} - {item['status']}" for item in self.step_responses
+        """
+        Generate a post-incident summary using session history and policy documents.
+        """
+        if not self.session_history:
+            return "No session history available."
+        
+        session_data = "\n".join([
+            f"{entry['role']}: {entry['content']}" 
+            for entry in self.session_history
         ])
-        incident_type = self.incident_types.get(self.current_incident, "Unknown")
-        prompt = POST_INCIDENT_PROMPT.format(
-            session_history=history_text,
-            incident_type=incident_type,
-            team_members=team_info
-        )
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        except Exception as e:
-            return f"Error generating comprehensive post-incident review: {e}"
+        
+        prompt = ChatPromptTemplate.from_template(POST_INCIDENT_PROMPT)
+        chain = prompt | self.llm | StrOutputParser()
+        
+        summary = chain.invoke({
+            "session_history": session_data,
+            "incident_type": self.current_incident_type or "Unknown",
+            "team_members": ", ".join(self.team_members)
+        })
+        
+        return summary
 
     def get_session_analysis(self) -> str:
-        """Generate detailed session analysis using LLM and RAG"""
-        if not self.step_responses:
-            return "No incident response session to analyze."
-        # Retrieve team info via RAG
-        team_info = self.get_team_info()
-        session_data = {
-            "incident_type": self.incident_types.get(self.current_incident, "Unknown"),
-            "total_steps": len(self.step_responses),
-            "completed_steps": len([s for s in self.step_responses if s['status'] == 'completed']),
-            "step_details": self.step_responses,
-            "team_info": team_info
-        }
-        prompt = SESSION_ANALYSIS_PROMPT.format(session_data=str(session_data))
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        except Exception as e:
-            return f"Error generating session analysis: {e}"
+        """
+        Provide a detailed analysis of the session (performance, team dynamics, etc.).
+        """
+        if not self.session_history:
+            return "No session data available for analysis."
+        
+        session_data = json.dumps(self.session_history, indent=2)
+        
+        prompt = ChatPromptTemplate.from_template(SESSION_ANALYSIS_PROMPT)
+        chain = prompt | self.llm | StrOutputParser()
+        
+        analysis = chain.invoke({"session_data": session_data})
+        return analysis
 
     def get_lessons_learned(self) -> str:
-        """Extract specific lessons learned using LLM and RAG"""
-        if not self.step_responses:
-            return "No incident response session to analyze for lessons learned."
-        # Retrieve team info via RAG
-        team_info = self.get_team_info()
-        session_context = {
-            "incident_type": self.incident_types.get(self.current_incident, "Unknown"),
-            "steps_completed": self.step_responses,
-            "team_info": team_info,
-            "response_duration": len(self.step_responses),
-        }
-        prompt = LESSONS_LEARNED_PROMPT.format(session_context=str(session_context))
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        except Exception as e:
-            return f"Error generating lessons learned: {e}"
+        """
+        Extract lessons learned from the session using LLM and session context.
+        """
+        if not self.session_history:
+            return "No session data available for lessons learned analysis."
+        
+        session_context = f"Incident Type: {self.current_incident_type}\nSteps Completed: {self.current_step_index}\nTeam Members: {', '.join(self.team_members)}"
+        
+        prompt = ChatPromptTemplate.from_template(LESSONS_LEARNED_PROMPT)
+        chain = prompt | self.llm | StrOutputParser()
+        
+        lessons = chain.invoke({"session_context": session_context})
+        return lessons
 
     def get_welcome_screen(self) -> str:
-        """Display the welcome screen with available simulation options"""
-        response = "🚨 **INCIDENT RESPONSE SIMULATION CENTER** 🚨\n\n"
-        response += "Welcome to the VCISO Incident Response Simulation System!\n\n"
-        response += "**Available Simulations:**\n"
-        response += "1. **Data Breach** - Simulate a data breach incident response\n"
-        response += "2. **Phishing Attack** - Simulate a phishing attack response\n"
-        response += "3. **Ransomware Attack** - Simulate a ransomware incident response\n\n"
-        response += "**To start a simulation, simply type:**\n"
-        response += "• `data_breach` (or `data breach`, `breach`)\n"
-        response += "• `phishing` (or `phish`)\n"
-        response += "• `ransomware` (or `ransom`)\n\n"
-        response += "**Other Commands:**\n"
-        response += "• `welcome` - Show this screen again\n"
-        response += "• `next` - Continue to next step (during simulation)\n"
-        response += "• `team` - View incident response team\n"
-        response += "• `overview` - See complete response plan\n"
-        response += "• `summary` - Generate post-incident summary\n"
-        response += "• `analysis` - Get detailed session analysis\n"
-        response += "• `lessons` - Extract lessons learned\n"
-        response += "• `clarify` - Get detailed explanation of current step\n\n"
-        response += "**Natural Language Support:**\n"
-        response += "You can also type natural phrases like:\n"
-        response += "• \"Start a phishing simulation\"\n"
-        response += "• \"Begin data breach response\"\n"
-        response += "• \"Launch ransomware incident\"\n\n"
-        response += "Ready to begin? Choose your simulation type!"
-        return response
+        """
+        Show a welcome/help message with all available commands and dynamically lists all supported incident types.
+        """
+        welcome = """
+# Incident Response Guidance System
+
+Welcome to the Incident Response Guidance System. I can help you:
+
+## Start a New Incident Response Session
+Choose an incident type to begin:
+"""
+        for incident_type in self.incident_types:
+            welcome += f"- {incident_type}\n"
+        
+        welcome += """
+## Available Commands
+- `start [incident_type]` - Start a new incident response session
+- `next` - Confirm current step and move to next
+- `clarify` - Get detailed guidance for current step
+- `overview` - Show incident response plan overview
+- `team` - Show team member information
+- `summary` - Get session summary
+- `analysis` - Get detailed session analysis
+- `lessons` - Extract lessons learned
+- `help` - Show this help message
+
+## Example Usage
+```
+start Data Breach
+next
+clarify
+overview
+summary
+```
+
+Type 'start [incident_type]' to begin an incident response session.
+"""
+        return welcome
+
+    def download_analysis(self) -> str:
+        """
+        Download the session analysis to a local file named 'incident_response_analysis.txt'.
+        Returns the file path to the user.
+        """
+        analysis = self.get_session_analysis()
+        filename = "incident_response_analysis.txt"
+        filepath = os.path.join(os.getcwd(), filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(analysis)
+        return f"Analysis saved to: {filepath}"
+
+    def complete_steps(self) -> str:
+        """
+        Mark all remaining steps as completed and move to the end of the plan.
+        Only works if an incident session is active; otherwise prompts the user to select an incident type first.
+        """
+        if not self.incident_plan:
+            return INSTRUCTION_NO_SESSION
+        while self.current_step_index < len(self.incident_plan.steps):
+            current_step = self.incident_plan.steps[self.current_step_index]
+            self.session_history.append({
+                "role": "system",
+                "content": f"Completed step: {current_step.title}"
+            })
+            self.current_step_index += 1
+        return (
+            "✅ All incident response steps are now completed for this incident!\n"
+            "You can now use the following commands to review and analyze the session:\n"
+            "- 'summary' — Get a session summary\n"
+            "- 'analysis' — Get a detailed session analysis\n"
+            "- 'lessons' — Extract lessons learned\n"
+            "- 'download' — Save the session analysis to a file\n"
+            "To start a new incident, type 'start [incident_type]'."
+        )
+
+    # Command groups for routing
+    INCIDENT_RELATED_COMMANDS = {
+        CMD_NEXT, CMD_COMPLETE, CMD_CLARIFY, CMD_OVERVIEW, CMD_SUMMARY, CMD_ANALYSIS, CMD_LESSONS
+    }
+    INCIDENT_AGNOSTIC_COMMANDS = {
+        CMD_TEAM, CMD_HELP, CMD_WELCOME, CMD_DOWNLOAD
+    }
 
     def process_incident_message(self, message: str, chat_history: Optional[list] = None) -> str:
-        """Process user messages for incident response"""
-        logger.debug(f"Processing incident message: {message}")
-        message = message.lower().strip()
-        if message == 'welcome':
+        """
+        Main command router for user messages.
+        - Organizes commands into incident-related and incident-agnostic groups for robust, future-proof handling.
+        - Only incident-related commands can affect the workflow/session.
+        - Incident-agnostic commands (team, help, download, etc.) never reset or break the session.
+        - Fuzzy/partial incident type matching only occurs if no command matches.
+        - If no command matches, provides a free-form LLM response.
+        """
+        message_lower = message.strip().lower()
+        # Incident-agnostic commands (never reset session)
+        if message_lower in self.INCIDENT_AGNOSTIC_COMMANDS:
+            if message_lower in {CMD_HELP, CMD_WELCOME}:
+                return self.get_welcome_screen()
+            if message_lower == CMD_TEAM:
+                return self.get_team_info()
+            if message_lower == CMD_DOWNLOAD:
+                return self.download_analysis()
+        # Incident-related commands (affect workflow/session)
+        if message_lower.startswith(CMD_START):
+            incident_type = message[len(CMD_START):].strip()
+            return self.start_incident_response(incident_type)
+        if message_lower in self.INCIDENT_RELATED_COMMANDS:
+            if message_lower == CMD_NEXT:
+                return self.confirm_step()
+            if message_lower == CMD_COMPLETE:
+                return self.complete_steps()
+            if message_lower == CMD_CLARIFY:
+                return self.clarify_current_step()
+            if message_lower == CMD_OVERVIEW:
+                return self.get_plan_overview()
+            if message_lower == CMD_SUMMARY:
+                return self.get_summary()
+            if message_lower == CMD_ANALYSIS:
+                return self.get_session_analysis()
+            if message_lower == CMD_LESSONS:
+                return self.get_lessons_learned()
+        # Fuzzy/partial match for incident types (only if not a command)
+        best_match = None
+        highest_ratio = 0.0
+        for valid in self.incident_types:
+            valid_lower = valid.lower()
+            # Exact or substring match
+            if message_lower in valid_lower:
+                best_match = valid
+                highest_ratio = 1.0
+                break
+            # Fuzzy match
+            ratio = difflib.SequenceMatcher(None, message_lower, valid_lower).ratio()
+            if ratio > highest_ratio:
+                best_match = valid
+                highest_ratio = ratio
+        # Accept if substring or fuzzy match is reasonably close
+        if highest_ratio >= 0.5:
+            return self.start_incident_response(best_match)
+        # If the user says "start a simulation" or similar, show the welcome/help screen
+        if message_lower in ["start a simulation", "start simulation", "begin simulation", "launch simulation"]:
             return self.get_welcome_screen()
-        elif message == 'next':
-            return self.confirm_step()
-        elif message == 'team':
-            return self.get_team_info()
-        elif message == 'overview':
-            return self.get_plan_overview()
-        elif message == 'summary':
-            return self.get_summary()
-        elif message == 'analysis':
-            return self.get_session_analysis()
-        elif message == 'lessons':
-            return self.get_lessons_learned()
-        elif message == 'clarify':
-            return self.clarify_current_step()
-        elif message in self.incident_types:
-            return self.start_incident_response(message)
-        else:
-            # Use LLM for free-form questions, with RAG context
-            logger.debug(f"Received message for free-form response: {message}")
-            return self._llm_free_form_response(message, chat_history)
+        # If no specific command, provide general guidance
+        return self._llm_free_form_response(message, chat_history)
 
     def _llm_free_form_response(self, message: str, chat_history: Optional[list] = None) -> str:
-        """Handle free-form user questions using LLM and RAG context"""
-        context = ""
-        if self.current_incident:
-            context = f"Current incident: {self.incident_types[self.current_incident]}\n"
-            if self.session_plan and self.current_step < len(self.session_plan):
-                step = self.session_plan[self.current_step]
-                context += f"Current step: {step.get('title', '')}\n"
-        # Retrieve relevant docs for the message
-        rag_docs = self.rag_retriever.retrieve(message, top_k=5) if self.rag_retriever else []
-        rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
-        prompt = f"""You are an expert incident response consultant.\n\n{context}\nRelevant policy excerpts:\n{rag_text}\n\nUser question: {message}\n\nProvide a helpful, actionable response based on incident response best practices and the current context."""
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else response
-        except Exception as e:
-            return f"I'm sorry, I encountered an error processing your question: {e}"
+        """
+        Handle free-form questions about incident response using the LLM.
+        """
+        if not self.llm:
+            return "LLM not initialized."
+        
+        prompt = f"""
+        You are an expert incident response consultant. The user is asking about incident response.
+        
+        User question: {message}
+        
+        If this is about starting an incident response session, suggest using 'start [incident_type]'.
+        If this is about the current session, provide helpful guidance.
+        If this is a general question about incident response, provide expert advice.
+        
+        Keep your response concise and actionable.
+        """
+        
+        response = self.llm.invoke(prompt)
+        return response.content if hasattr(response, "content") else str(response)
 
 class RAGDocumentLoader:
     def __init__(self, folder: str, chunk_size: int = 1000, chunk_overlap: int = 200):
@@ -565,7 +717,7 @@ class RAGDocumentLoader:
         self.documents = []
         self.chunks = []
         for path in glob.glob(os.path.join(self.folder, "*")):
-            logger.debug(f"Processing document: {path}")
+            logger.info(f"Processing document: {path}")
             if os.path.isdir(path):
                 continue  # Skip directories
             doc_name = os.path.basename(path)
@@ -580,8 +732,6 @@ class RAGDocumentLoader:
             else:
                 logger.warning(f"Unsupported file extension for document: {doc_name}")
         logger.info(f"Loaded {len(self.chunks)} document chunks.")
-        if self.chunks:
-            logger.debug(f"First chunk: {self.chunks[0]}")
 
     def _load_pdf(self, path, doc_name):
         try:
@@ -630,8 +780,7 @@ class RAGDocumentLoader:
 class RAGRetriever:
     def __init__(self, chunks: List[DocumentChunk]):
         self.chunks = chunks
-        # Use settings to disable telemetry
-        self.client = chromadb.Client(Settings(anonymized_telemetry=False))
+        self.client = chromadb.Client()
         self.collection = self.client.create_collection("irp_docs")
         self._index_chunks()
 
@@ -677,6 +826,8 @@ class VisoPart3:
     def __init__(self):
         self.llm = None
         self.search_tool = None
+        self.graph = None
+        self.opik_tracer = None
         self.state = {
             'interaction_count': 0,
             'recommendations_by_section': {},
@@ -685,163 +836,221 @@ class VisoPart3:
         self.rag_loader = RAGDocumentLoader(DOCUMENTS_FOLDER)
         self.rag_loader.load_documents()
         self.rag_retriever = RAGRetriever(self.rag_loader.get_chunks())
-        # Initialize incident response guide
         self.incident_guide = IncidentResponseGuide(self.rag_retriever)
 
     def initialize(self):
         self.llm = init_chat_model("gpt-4o-mini", model_provider="openai")
         self.search_tool = TavilySearch(max_results=3, max_tokens=MAX_TOKENS)
+        self.state['main_sections'] = get_main_sections_from_llm(self.llm)
         self.incident_guide.set_llm(self.llm)
+        self.incident_guide.set_rag_retriever(self.rag_retriever)
+        
+        # Create the LangGraph workflow
+        graph = StateGraph(IncidentResponseState)
+        
+        # Add nodes
+        graph.add_node("command_router", self._command_router_node)
+        graph.add_node("response_generator", self._response_generator_node)
+        
+        # Add edges with conditional routing
+        graph.add_edge(START, "command_router")
+        graph.add_conditional_edges(
+            "command_router",
+            self._route_to_response,
+            {
+                "incident": "response_generator",
+                "policy": "response_generator", 
+                "welcome": "response_generator",
+                "agnostic": "response_generator"
+            }
+        )
+        graph.add_edge("response_generator", END)
+        
+        # Compile the graph
+        self.graph = graph.compile()
+
+        # Initialize Opik tracer only if enabled
+        if ENABLE_OPIK_TRACING:
+            self.opik_tracer = OpikTracer(graph=self.graph.get_graph(xray=True))
+            logger.info("Opik tracing enabled")
+        else:
+            self.opik_tracer = None
+            logger.info("Opik tracing disabled")
+
+    def _command_router_node(self, state: IncidentResponseState):
+        """Route the user message to the appropriate handler."""
+        message = state["user_message"].strip().lower()
+        logger.info(f"Command router processing: '{message}'")
+
+        # Check if this is an incident-agnostic command
+        if message in self.incident_guide.INCIDENT_AGNOSTIC_COMMANDS:
+            logger.info(f"Routing to agnostic handler for message: '{message}'")
+            return {"command_type": "agnostic"}
+        # Check if this is an incident response command
+        if message in self.incident_guide.INCIDENT_RELATED_COMMANDS or message.startswith(CMD_START):
+            logger.info(f"Routing to incident handler for message: '{message}'")
+            return {"command_type": "incident"}
+        # Check if this is a policy analysis command
+        policy_commands = ["analyze", "review", "policy"]
+        if any(cmd in message for cmd in policy_commands):
+            logger.info(f"Routing to policy handler for message: '{message}'")
+            return {"command_type": "policy"}
+        # Default to welcome/help
+        logger.info(f"Routing to welcome handler for message: '{message}'")
+        return {"command_type": "welcome"}
+
+    def _route_to_response(self, state: IncidentResponseState):
+        """Route to the appropriate response type."""
+        return state.get("command_type", "welcome")
+
+    def _response_generator_node(self, state: IncidentResponseState):
+        """Generate the appropriate response based on command type."""
+        command_type = state.get("command_type", "welcome")
+        message = state["user_message"]
+        logger.info(f"Response generator - command_type: '{command_type}', message: '{message}'")
+
+        if command_type == "incident":
+            logger.info("Generating incident response")
+            response = self.incident_guide.process_incident_message(message)
+        elif command_type == "policy":
+            logger.info("Generating policy response")
+            response = "Policy analysis functionality coming soon. Use incident response commands for now."
+        elif command_type == "agnostic":
+            logger.info("Generating agnostic response")
+            response = self.incident_guide.process_incident_message(message)
+        else:  # welcome
+            logger.info("Generating welcome response")
+            response = self.incident_guide.get_welcome_screen()
+
+        logger.info(f"Generated response length: {len(response)}")
+        return {"response_result": response}
 
     def normalize_command(self, message: str) -> str:
-        """Normalize user input by stripping common phrases and mapping variations"""
-        message = message.lower().strip()
+        """Normalize user input to standard commands."""
+        message_lower = message.strip().lower()
         
-        # Handle special cases first
-        if any(phrase in message for phrase in ['start a simulation', 'start simulation', 'begin simulation', 'launch simulation']):
-            return 'welcome'
+        # Incident response commands
+        if message_lower in ["help", "welcome", "intro"]:
+            return CMD_HELP
+        if message_lower.startswith(CMD_START):
+            return message  # Keep as-is
+        if message_lower in ["next", "continue", "proceed"]:
+            return CMD_NEXT
+        if message_lower in ["clarify", "explain", "details"]:
+            return CMD_CLARIFY
+        if message_lower in ["overview", "plan", "steps"]:
+            return CMD_OVERVIEW
+        if message_lower in ["team", "members", "roles"]:
+            return CMD_TEAM
+        if message_lower in ["summary", "report"]:
+            return CMD_SUMMARY
+        if message_lower in ["analysis", "analyze"]:
+            return CMD_ANALYSIS
+        if message_lower in ["lessons", "learned"]:
+            return CMD_LESSONS
         
-        # Strip common phrases
-        phrases_to_remove = [
-            'start', 'initiate', 'begin', 'launch', 'run', 'execute',
-            'simulation', 'simulate', 'a simulation', 'the simulation',
-            'incident', 'response', 'incident response'
-        ]
+        # Policy analysis commands
+        if message_lower in ["analyze", "policy", "review"]:
+            return "analyze" # This normalization is not in the new_code, so keep it as is
+        if message_lower in ["download", "save", "export"]:
+            return CMD_DOWNLOAD
         
-        for phrase in phrases_to_remove:
-            message = message.replace(phrase, '').strip()
-        
-        # Remove extra whitespace and punctuation
-        message = re.sub(r'\s+', ' ', message).strip()
-        message = message.strip('.,!?')
-        
-        # If we're left with just "a" or empty, return welcome
-        if message in ['a', 'the', '']:
-            return 'welcome'
-        
-        # Map variations to standard commands
-        command_mapping = {
-            # Incident types
-            'data breach': 'data_breach',
-            'databreach': 'data_breach',
-            'breach': 'data_breach',
-            'phishing': 'phishing',
-            'phish': 'phishing',
-            'ransomware': 'ransomware',
-            'ransom': 'ransomware',
-            
-            # Command variations
-            'welcome': 'welcome',
-            'help': 'welcome',
-            'menu': 'welcome',
-            'next': 'next',
-            'continue': 'next',
-            'proceed': 'next',
-            'team': 'team',
-            'roster': 'team',
-            'members': 'team',
-            'overview': 'overview',
-            'plan': 'overview',
-            'summary': 'summary',
-            'report': 'summary',
-            'analysis': 'analysis',
-            'analyze': 'analysis',
-            'lessons': 'lessons',
-            'learned': 'lessons',
-            'clarify': 'clarify',
-            'explain': 'clarify',
-            'details': 'clarify'
-        }
-        
-        return command_mapping.get(message, message)
+        # If no specific command, return as-is for free-form processing
+        return message
 
     def process_message(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        """Process user messages for both RAG analysis and incident response"""
-        if not self.llm:
-            self.initialize()
+        """Process a message using the LangGraph workflow."""
+        logger.info(f"Processing message: {message}")
         
-        # Increment interaction count and check limit (consistent with part1.py and part2.py)
+        # Intercept simulation start phrases and map to 'welcome'
+        simulation_phrases = [
+            "start a simulation.", "start a simulation", "start simulation", "begin simulation", "launch simulation"
+        ]
+        if message.strip().lower() in simulation_phrases:
+            message = CMD_WELCOME # Changed from "welcome" to CMD_WELCOME
+        
+        # Increment interaction count
         self.state['interaction_count'] += 1
         if self.state['interaction_count'] > MAX_INTERACTIONS:
-            return ("Session limit reached. Please restart the app to continue. "
-                    "This is to prevent excessive usage and potential infinite loops.")
+            return "Session limit reached. Please restart the app to continue."
         
-        # Normalize the command
-        normalized_message = self.normalize_command(message)
-        logger.debug(f"Original message: '{message}' -> Normalized: '{normalized_message}'")
+        # Create initial state
+        initial_state = {
+            "user_message": message,  # Use possibly remapped message
+            "incident_type": self.incident_guide.current_incident_type,
+            "current_step_index": self.incident_guide.current_step_index,
+            "incident_plan": self.incident_guide.incident_plan,
+            "session_history": self.incident_guide.session_history,
+            "team_members": self.incident_guide.team_members,
+            "current_step_text": "",
+            "response_result": "",
+            "interaction_count": self.state['interaction_count'],
+            "command_type": None
+        }
         
-        # Check if this is an incident response command
-        if (normalized_message in ['welcome', 'next', 'team', 'overview', 'summary', 'analysis', 'lessons', 'clarify'] or 
-            normalized_message in self.incident_guide.incident_types):
-            return self.incident_guide.process_incident_message(normalized_message, history)
-        logger.debug(f"Processing message: {normalized_message}")
+        # Prepare config with conditional Opik tracer
+        config = {}
+        if ENABLE_OPIK_TRACING and self.opik_tracer:
+            config["callbacks"] = [self.opik_tracer]
+            logger.debug("Using Opik tracer for this query")
+        else:
+            logger.debug("Opik tracer not used for this query")
         
-        # Check if this is a section analysis request
-        section = self._find_section(normalized_message)
-        if section:
-            return self._analyze_section(section)
+        # Execute the workflow
+        result = self.graph.invoke(initial_state, config=config)
         
-        # Default to RAG-based policy analysis
-        return self._process_policy_analysis(normalized_message, history)
+        logger.info(f"Incident response completed. Response length: {len(result.get('response_result', ''))}")
+        return result.get("response_result", "No response generated")
 
     def _find_section(self, user_input: str) -> Optional[str]:
-        """Find if user input matches any main section"""
+        """Find which section the user is referring to."""
+        user_input_lower = user_input.lower()
         for section in self.state['main_sections']:
-            if section.lower() in user_input.lower():
+            if section.lower() in user_input_lower:
                 return section
         return None
 
     def _analyze_section(self, section: str) -> str:
-        """Analyze a specific section using RAG"""
+        """Analyze a specific section using RAG."""
+        logger.info(f"Analyzing section: {section}")
+        
         # Retrieve relevant documents
-        rag_docs = self.rag_retriever.retrieve(section)
-        rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
+        query = f"incident response plan {section.lower()} policy procedures guidelines"
+        rag_docs = self.rag_retriever.retrieve(query, top_k=5)
         
-        # Generate analysis
-        prompt = ANALYSIS_PROMPT.format(section=section, rag_docs=rag_text)
-        response = self.llm.invoke(prompt)
+        if not rag_docs:
+            return f"No relevant documents found for {section} analysis."
         
-        # Store recommendations
-        self.state['recommendations_by_section'][section] = response.content if hasattr(response, "content") else response
-        
-        return response.content if hasattr(response, "content") else response
+        # For now, return a simple analysis
+        return f"Analysis for {section} would be performed here using the retrieved documents."
 
     def _process_policy_analysis(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        """Process general policy analysis questions"""
-        # Retrieve relevant documents
-        rag_docs = self.rag_retriever.retrieve(message)
-        rag_text = "\n\n".join([f"From {doc['doc_name']} ({doc['section']}): {doc['content']}" for doc in rag_docs])
-        
-        # Generate response
-        prompt = f"""You are an expert security consultant. The user asked: {message}
-
-Here are relevant excerpts from their policy documents:
-{rag_text}
-
-Provide a comprehensive, helpful response based on the documents and security best practices."""
-        
-        response = self.llm.invoke(prompt)
-        return response.content if hasattr(response, "content") else response
+        """Process policy analysis requests."""
+        # This would integrate the full policy analysis functionality
+        return "Policy analysis functionality is being integrated. Please use incident response commands for now."
 
     def review_recommendations(self) -> str:
-        """Review all recommendations made during the session"""
+        """Review all recommendations made so far."""
         if not self.state['recommendations_by_section']:
-            return "No recommendations have been generated yet. Please analyze some sections first."
+            return "No recommendations have been generated yet."
         
-        return self.download_recommendations()
+        review = "## Policy Analysis Summary\n"
+        for section, analysis in self.state['recommendations_by_section'].items():
+            review += f"### {section}\n{analysis}\n"
+        
+        return review
 
     def download_recommendations(self) -> str:
-        """Format recommendations for download"""
+        """Download recommendations to a file."""
         if not self.state['recommendations_by_section']:
-            return "No recommendations available."
+            return "No recommendations to download."
         
-        report = "VCISO Security Recommendations Report\n"
-        report += "=" * 50 + "\n\n"
+        content = self.review_recommendations()
+        filename = "incident_response_recommendations.txt"
+        filepath = os.path.join(os.getcwd(), filename)
         
-        for section, recommendation in self.state['recommendations_by_section'].items():
-            report += f"Section: {section}\n"
-            report += "-" * 30 + "\n"
-            report += recommendation + "\n\n"
+        with open(filepath, 'w') as f:
+            f.write(content)
         
-        return report
+        return f"Recommendations saved to: {filepath}"
 

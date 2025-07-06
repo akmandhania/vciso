@@ -5,18 +5,21 @@ import docx
 import os
 import glob
 import json
+import logging
 from langchain_tavily import TavilySearch
 from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-import logging
+from opik.integrations.langchain import OpikTracer
 import chromadb
-from chromadb.utils import embedding_functions
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("vciso.part2")
 logging.basicConfig(level=logging.INFO)
+
+# Configuration flags
+ENABLE_OPIK_TRACING = False  # Set to True to enable Opik tracing
 
 MAX_TOKENS = 1024
 MAX_INTERACTIONS = 30
@@ -43,6 +46,15 @@ class DocumentChunk(TypedDict):
     section: str
     content: str
     chunk_id: str
+
+class PolicyAnalysisState(TypedDict):
+    """State for the policy analysis workflow."""
+    user_message: str
+    current_section: Optional[str]
+    rag_docs: List[Dict[str, str]]
+    analysis_result: str
+    recommendations_by_section: Dict[str, str]
+    interaction_count: int
 
 class RAGDocumentLoader:
     def __init__(self, folder: str, chunk_size: int = 1000, chunk_overlap: int = 200):
@@ -186,6 +198,8 @@ class VisoPart2:
     def __init__(self):
         self.llm = None
         self.search_tool = None
+        self.graph = None
+        self.opik_tracer = None
         self.state = {
             'interaction_count': 0,
             'recommendations_by_section': {},
@@ -199,100 +213,201 @@ class VisoPart2:
         self.llm = init_chat_model("gpt-4o-mini", model_provider="openai")
         self.search_tool = TavilySearch(max_results=3, max_tokens=MAX_TOKENS)
         self.state['main_sections'] = get_main_sections_from_llm(self.llm)
+        
+        # Create the LangGraph workflow
+        graph = StateGraph(PolicyAnalysisState)
+        
+        # Add nodes
+        graph.add_node("command_router", self._command_router_node)
+        graph.add_node("section_analyzer", self._section_analyzer_node)
+        graph.add_node("welcome_handler", self._welcome_handler_node)
+        graph.add_node("selection_handler", self._selection_handler_node)
+        graph.add_node("review_handler", self._review_handler_node)
+        graph.add_node("download_handler", self._download_handler_node)
+        
+        # Add edges
+        graph.add_edge(START, "command_router")
+        graph.add_edge("command_router", "welcome_handler")
+        graph.add_edge("command_router", "selection_handler")
+        graph.add_edge("command_router", "section_analyzer")
+        graph.add_edge("command_router", "review_handler")
+        graph.add_edge("command_router", "download_handler")
+        graph.add_edge("welcome_handler", END)
+        graph.add_edge("selection_handler", END)
+        graph.add_edge("section_analyzer", END)
+        graph.add_edge("review_handler", END)
+        graph.add_edge("download_handler", END)
+        
+        # Compile the graph
+        self.graph = graph.compile()
+
+        # Initialize Opik tracer only if enabled
+        if ENABLE_OPIK_TRACING:
+            self.opik_tracer = OpikTracer(graph=self.graph.get_graph(xray=True))
+            logger.info("Opik tracing enabled")
+        else:
+            self.opik_tracer = None
+            logger.info("Opik tracing disabled")
+
+    def _command_router_node(self, state: PolicyAnalysisState):
+        """Route the user message to the appropriate handler."""
+        message = state["user_message"].strip().lower()
+        
+        if message in ["start", "begin", "help", "welcome"]:
+            return {"next_step": "welcome"}
+        elif any(section.lower() in message for section in self.state['main_sections']):
+            return {"next_step": "analyze"}
+        elif message in ["review", "summary", "recommendations"]:
+            return {"next_step": "review"}
+        elif message in ["download", "save", "export"]:
+            return {"next_step": "download"}
+        else:
+            return {"next_step": "selection"}
+
+    def _welcome_handler_node(self, state: PolicyAnalysisState):
+        """Handle welcome and help messages."""
+        return {"analysis_result": self._get_welcome_message()}
+
+    def _selection_handler_node(self, state: PolicyAnalysisState):
+        """Handle section selection."""
+        return {"analysis_result": self._get_selection_prompt()}
+
+    def _section_analyzer_node(self, state: PolicyAnalysisState):
+        """Analyze a specific section."""
+        section = self._find_section(state["user_message"])
+        if section:
+            analysis = self._analyze_section(section)
+            # Store the analysis result
+            self.state['recommendations_by_section'][section] = analysis
+            return {"analysis_result": analysis, "current_section": section}
+        else:
+            return {"analysis_result": "I couldn't identify a specific section. Please specify which section you'd like to analyze."}
+
+    def _review_handler_node(self, state: PolicyAnalysisState):
+        """Review all recommendations."""
+        return {"analysis_result": self.review_recommendations()}
+
+    def _download_handler_node(self, state: PolicyAnalysisState):
+        """Download recommendations."""
+        return {"analysis_result": self.download_recommendations()}
 
     def process_message(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """Process a message using the LangGraph workflow."""
+        logger.info(f"Processing message: {message}")
+        
+        # Increment interaction count
         self.state['interaction_count'] += 1
         if self.state['interaction_count'] > MAX_INTERACTIONS:
-            return ("Session limit reached. Please restart the app to continue. "
-                    "This is to prevent excessive usage and potential infinite loops.")
-
-        user_input = message.strip().lower()
-
-        if user_input == 'review':
-            return self.review_recommendations()
-        if user_input == 'download':
-            return self.download_recommendations()
-
-        selected_section = self._find_section(user_input)
-        if selected_section:
-            return self._analyze_section(selected_section)
-
-        return self._get_welcome_message()
+            return "Session limit reached. Please restart the app to continue."
+        
+        # Create initial state
+        initial_state = {
+            "user_message": message,
+            "current_section": None,
+            "rag_docs": [],
+            "analysis_result": "",
+            "recommendations_by_section": self.state['recommendations_by_section'],
+            "interaction_count": self.state['interaction_count']
+        }
+        
+        # Prepare config with conditional Opik tracer
+        config = {}
+        if ENABLE_OPIK_TRACING and self.opik_tracer:
+            config["callbacks"] = [self.opik_tracer]
+            logger.debug("Using Opik tracer for this query")
+        else:
+            logger.debug("Opik tracer not used for this query")
+        
+        # Execute the workflow
+        result = self.graph.invoke(initial_state, config=config)
+        
+        # Update state with results
+        if "current_section" in result:
+            self.state['current_section'] = result["current_section"]
+        if "recommendations_by_section" in result:
+            self.state['recommendations_by_section'].update(result["recommendations_by_section"])
+        
+        logger.info(f"Policy analysis completed. Response length: {len(result.get('analysis_result', ''))}")
+        return result.get("analysis_result", "No response generated")
 
     def _find_section(self, user_input: str) -> Optional[str]:
+        """Find which section the user is referring to."""
+        user_input_lower = user_input.lower()
         for section in self.state['main_sections']:
-            if user_input.lower() == section.lower():
+            if section.lower() in user_input_lower:
                 return section
         return None
 
     def _get_welcome_message(self) -> str:
-        welcome = "Welcome! I can help you evaluate your incident response policies against industry best practices.\n\n"
-        return welcome + self._get_selection_prompt()
-
-    def _get_selection_prompt(self) -> str:
-        all_sections = self.state['main_sections']
-        evaluated_sections = list(self.state['recommendations_by_section'].keys())
-        unevaluated_sections = [s for s in all_sections if s not in evaluated_sections]
-
-        message = ""
-        if unevaluated_sections:
-            message += "Here are the sections yet to be evaluated:\n"
-            message += "- " + "\n- ".join(unevaluated_sections) + "\n\nPlease select a section to analyze.\n\n"
-        else:
-            message += "All sections have been evaluated.\n\n"
-        
-        if evaluated_sections:
-            message += "Evaluated sections:\n"
-            message += "- " + "\n- ".join(evaluated_sections) + "\n\n"
-        
-        message += "You can also type 'review' to see all recommendations so far, or 'download' to save them."
-        return message
-
-    def _analyze_section(self, section: str) -> str:
-        if section in self.state['recommendations_by_section']:
-            return (
-                f"The '{section}' section has already been evaluated.\n\n" +
-                self._get_selection_prompt()
-            )
-        logger.info(f"Analyzing section: {section}")
-        rag_docs = self.rag_retriever.retrieve(section, top_k=10)
-        logger.info(f"Retrieved {len(rag_docs)} docs for section: {section}")
-
-        rag_docs_str = "\n\n".join([
-            f"Document: {doc['doc_name']} ({doc['section']})\nContent: {doc['content']}"
-            for doc in rag_docs
-        ]) if rag_docs else "No relevant documents found."
-
-        prompt = ANALYSIS_PROMPT.format(section=section, rag_docs=rag_docs_str)
-        
-        response = self.llm.invoke(prompt)
-        analysis = response.content if hasattr(response, "content") else response
-
-        self.state['recommendations_by_section'][section] = analysis
-        
+        """Get the welcome message."""
         return (
-            analysis + 
-            "\n\n------------------------------------------------------------\n" +
-            self._get_selection_prompt()
+            "Welcome to the Incident Response Plan Policy Analyzer!\n\n"
+            "I can help you analyze your existing policy documents and provide recommendations "
+            "for improving your incident response plan.\n\n"
+            "Available sections to analyze:\n" +
+            "\n".join(f"- {section}" for section in self.state['main_sections']) +
+            "\n\nTo get started, tell me which section you'd like to analyze, or type 'review' to see all recommendations."
         )
 
-    def review_recommendations(self) -> str:
-        if not self.state['recommendations_by_section']:
-            return "No recommendations have been generated yet. Please select a section to analyze first."
+    def _get_selection_prompt(self) -> str:
+        """Get the section selection prompt."""
+        return (
+            "Please specify which section of your Incident Response Plan you'd like me to analyze:\n\n" +
+            "\n".join(f"- {section}" for section in self.state['main_sections']) +
+            "\n\nYou can also type:\n"
+            "- 'review' to see all recommendations\n"
+            "- 'download' to save recommendations to a file"
+        )
 
-        full_report = "--- Incident Response Plan Recommendations ---\n\n"
-        for section, recommendations in self.state['recommendations_by_section'].items():
-            full_report += f"--- Section: {section} ---\n"
-            full_report += recommendations + "\n\n"
+    def _analyze_section(self, section: str) -> str:
+        """Analyze a specific section using RAG."""
+        logger.info(f"Analyzing section: {section}")
         
-        return full_report
+        # Retrieve relevant documents
+        query = f"incident response plan {section.lower()} policy procedures guidelines"
+        rag_docs = self.rag_retriever.retrieve(query, top_k=5)
+        
+        if not rag_docs:
+            rag_docs_text = "No relevant documents found in the current document set."
+        else:
+            rag_docs_text = "\n\n".join([
+                f"Document: {doc['doc_name']}\nSection: {doc['section']}\nContent: {doc['content'][:500]}..."
+                for doc in rag_docs
+            ])
+        
+        # Create the analysis prompt
+        prompt = ChatPromptTemplate.from_template(ANALYSIS_PROMPT)
+        chain = prompt | self.llm | StrOutputParser()
+        
+        # Perform the analysis
+        analysis = chain.invoke({
+            "section": section,
+            "rag_docs": rag_docs_text
+        })
+        
+        return f"## Analysis for {section}\n\n{analysis}"
+
+    def review_recommendations(self) -> str:
+        """Review all recommendations made so far."""
+        if not self.state['recommendations_by_section']:
+            return "No recommendations have been generated yet. Please analyze at least one section first."
+        
+        review = "## Policy Analysis Summary\n\n"
+        for section, analysis in self.state['recommendations_by_section'].items():
+            review += f"### {section}\n{analysis}\n\n"
+        
+        return review
 
     def download_recommendations(self) -> str:
-        report = self.review_recommendations()
-        if report.startswith("No recommendations"):
-            return report
+        """Download recommendations to a file."""
+        if not self.state['recommendations_by_section']:
+            return "No recommendations to download. Please analyze at least one section first."
         
-        path = os.path.join(os.getcwd(), 'irp_recommendations.txt')
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(report)
-        return f"Recommendations saved to: {path}"
+        content = self.review_recommendations()
+        filename = "policy_recommendations.txt"
+        filepath = os.path.join(os.getcwd(), filename)
+        
+        with open(filepath, 'w') as f:
+            f.write(content)
+        
+        return f"Recommendations saved to: {filepath}"
